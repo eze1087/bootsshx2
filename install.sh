@@ -15,6 +15,9 @@ BOT_HOME="/root/ssh-bot"
 DB_FILE="$INSTALL_DIR/data/users.db"
 CONFIG_FILE="$INSTALL_DIR/config/config.json"
 
+# Ruta del instalador (para ubicar panel_admin.sh local)
+SCRIPT_PATH="${SCRIPT_PATH:-$0}"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -115,6 +118,16 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 npm install -g pm2 --silent >/dev/null 2>&1 || true
+
+# Asegurar pm2 en PATH (algunas distros no lo ven en /usr/local/bin)
+if ! command -v pm2 >/dev/null 2>&1; then
+  npm install -g pm2 --silent >/dev/null 2>&1 || true
+fi
+PM2_BIN=$(command -v pm2 2>/dev/null || true)
+if [[ -n "$PM2_BIN" && ! -x /usr/bin/pm2 ]]; then
+  ln -sf "$PM2_BIN" /usr/bin/pm2 2>/dev/null || true
+fi
+
 
 mkdir -p "$INSTALL_DIR"/{data,config,qr_codes,logs,backups}
 mkdir -p "$BOT_HOME"/{config,data,apks,hc,logs}
@@ -605,6 +618,113 @@ function appLabel(app) {
   return app || "";
 }
 
+// ---------------- HWID helpers (HC/Custom) ----------------
+function sanitizeHwid(raw) {
+  const s = String(raw || "").trim();
+  // Allow only safe chars for linux username and filename
+  const cleaned = s.replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!cleaned || cleaned.length < 4 || cleaned.length > 32) return null;
+  return cleaned;
+}
+
+async function createDbUserFromHwid(phone, plan, hwidRaw) {
+  const hwid = sanitizeHwid(hwidRaw);
+  if (!hwid) throw new Error("HWID inválido. Usá solo letras/números y sin espacios.");
+  // Username/password = HWID (requested)
+  const username = hwid.toLowerCase();
+  const password = hwid;
+
+  const days = planDays(plan);
+  const appType = "hc";
+  const expiresAt = days === 0
+    ? moment().add(TEST_HOURS, "hours").format("YYYY-MM-DD HH:mm:ss")
+    : moment().add(days, "days").endOf("day").format("YYYY-MM-DD HH:mm:ss");
+
+  await ensureSystemUser(username, password, expiresAt);
+
+  await dbRun(
+    `INSERT OR REPLACE INTO users (phone, username, password, tipo, expires_at, max_connections, status, hwid, app_type)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    [phone, username, password, plan === "test" ? "test" : "premium", expiresAt, 1, hwid, appType]
+  );
+
+  return { username, password, expires_at: expiresAt, hwid };
+}
+
+async function getHcFilePath(hwidRaw) {
+  const hwid = sanitizeHwid(hwidRaw);
+  if (!hwid) return null;
+  const candidates = [
+    path.join(HC_DIR, `${hwid}.hc`),
+    path.join(HC_DIR, `${hwid.toLowerCase()}.hc`),
+    path.join(HC_DIR, `${hwid.toUpperCase()}.hc`),
+  ];
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  return null;
+}
+
+async function markPaymentAwaitHwid(paymentId) {
+  await dbRun(`UPDATE payments SET status='await_hwid', delivered=0 WHERE payment_id=?`, [paymentId]);
+}
+
+async function markPaymentCompleted(paymentId, hwidRaw) {
+  const hwid = sanitizeHwid(hwidRaw) || "";
+  await dbRun(`UPDATE payments SET status='completed', delivered=1, approved_at=CURRENT_TIMESTAMP, hwid=? WHERE payment_id=?`, [hwid, paymentId]);
+}
+
+async function getAwaitHwidPaymentForPhone(phone) {
+  return await dbGet(`SELECT * FROM payments WHERE phone=? AND status='await_hwid' AND delivered=0 ORDER BY id DESC LIMIT 1`, [phone]);
+}
+
+// Try finalize a pending HC payment by sending HWID
+async function tryFinalizeHwidFlow(phone, msg, text) {
+  const lower = String(text || "").trim().toLowerCase();
+  // ignore commands
+  const known = ["menu","hola","start","hi","1","2","3","4","5","6","7","8","9","0","mp","mercadopago","transferencia"];
+  if (known.includes(lower) || lower.startsWith("verificar ") || lower.startsWith("confirmar pago")) return false;
+
+  const pay = await getAwaitHwidPaymentForPhone(phone);
+  if (!pay) return false;
+
+  const hwid = sanitizeHwid(text);
+  if (!hwid) {
+    await client.sendMessage(msg.from, "⚠️ Ese HWID no es válido. Enviá solo el código (sin espacios).", { sendSeen: false });
+    return true;
+  }
+
+  const plan = pay.plan || "30d";
+  const u = await createDbUserFromHwid(phone, plan, hwid);
+
+  // Send HC file if exists
+  const hcPath = await getHcFilePath(hwid);
+  if (hcPath) {
+    try {
+      const media = MessageMedia.fromFilePath(hcPath);
+      await client.sendMessage(msg.from, media, { caption: `🧩 Archivo HC: ${path.basename(hcPath)}`, sendSeen: false });
+    } catch {}
+  }
+
+  await markPaymentCompleted(pay.payment_id, hwid);
+
+  const msgTxt =
+`✅ *Pago aprobado* y *Custom activado*.
+
+👤 Usuario: *${u.username}*
+🔐 Clave: *${u.password}*
+🆔 HWID: *${hwid}*
+⏳ Vence: *${moment(u.expires_at).format("DD/MM/YYYY HH:mm")}*
+
+${customDownloadText()}
+
+📌 Escribí *menu* para ver opciones.`;
+
+  await client.sendMessage(msg.from, msgTxt, { sendSeen: false });
+  return true;
+}
+
+
 async function createDbUser(phone, plan, appType, hwid="", maxConn=1) {
   const { username, password } = makeCredentials();
   const exp = computeExpiry(plan);
@@ -806,23 +926,51 @@ async function mpProcessPendingPayments(client) {
         await safeSend(client, p.phone,
           `🎉 *PAGO CONFIRMADO*\n\n🔑 *Token*: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`
         );
-      } else {
-        const u = await createDbUser(p.phone, plan, appType);
-        let extra = "";
-        if (appType === "apk") {
-          const d = downloadsCfg();
-          if (d.apk_url) extra = `\n\n📲 Descarga APK:\n${d.apk_url}`;
-          else extra = "\n\n📲 Escribí *5* para descargar la app.";
-        } else if (appType === "hc") {
-          extra = "\n\n🆔 Enviá tu *HWID* para activar.\n" + customDownloadText();
-        }
-        await safeSend(client, p.phone,
-          `🎉 *PAGO CONFIRMADO*\n\n👤 Usuario: *${u.username}*\n🔐 Pass: *${u.password}*\n📅 Expira: *${u.expires_at || "∞"}*${extra}`
-        );
-      }
+} else {
+  // Plan paid: deliver depending on app type
+  if (appType === "hc") {
+    await safeSend(client, p.phone,
+      `✅ *Pago aprobado*.
 
-      await dbRun("UPDATE payments SET delivered=1 WHERE external_reference=?", [p.external_reference]);
-    } catch (e) {
+🧩 Elegiste *Custom / HC (HWID)*.
+
+🆔 Enviá tu *HWID* ahora para activar.
+
+${customDownloadText()}
+
+📌 (Enviá solo el código, sin espacios).`
+    );
+    await markPaymentAwaitHwid(p.external_reference);
+    continue;
+  }
+
+  const u = await createDbUser(p.phone, plan, appType);
+
+  let extra = "";
+  if (appType === "apk") {
+    const d = downloadsCfg();
+    if (d.apk_url) extra = `
+
+📲 Descarga APK:
+${d.apk_url}`;
+    else extra = `
+
+📲 Escribí *5* para descargar la app.`;
+  } else if (appType === "token") {
+    // token delivery handled by createDbUser
+  }
+
+  await safeSend(client, p.phone,
+    `🎉 *PAGO CONFIRMADO*
+
+👤 Usuario: *${u.username}*
+🔐 Pass: *${u.password}*
+📅 Expira: *${u.expires_at || "∞"}*${extra}`
+  );
+
+  await dbRun("UPDATE payments SET delivered=1 WHERE external_reference=?", [p.external_reference]);
+}
+} catch (e) {
       log(`MP process error: ${e && e.message ? e.message : e}`);
     }
   }
@@ -846,22 +994,49 @@ async function transferProcessApprovedPayments(client) {
         await safeSend(client, p.phone,
           `🎉 *PAGO CONFIRMADO (Transferencia)*\n\n🔑 *Token*: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`
         );
-      } else {
-        const u = await createDbUser(p.phone, plan, appType);
-        let extra = "";
-        if (appType === "apk") {
-          const d = downloadsCfg();
-          if (d.apk_url) extra = `\n\n📲 Descarga APK:\n${d.apk_url}`;
-          else extra = "\n\n📲 Escribí *5* para descargar la app.";
-        } else if (appType === "hc") {
-          extra = "\n\n🆔 Enviá tu *HWID* para activar.\n" + customDownloadText();
-        }
-        await safeSend(client, p.phone,
-          `🎉 *PAGO CONFIRMADO (Transferencia)*\n\n👤 Usuario: *${u.username}*\n🔐 Pass: *${u.password}*\n📅 Expira: *${u.expires_at || "∞"}*${extra}`
-        );
-      }
-      await dbRun("UPDATE payments SET delivered=1 WHERE external_reference=?", [p.external_reference]);
-    } catch (e) {
+      
+} else {
+  if (appType === "hc") {
+    await safeSend(client, p.phone,
+      `✅ *Pago por transferencia aprobado*.
+
+🧩 Elegiste *Custom / HC (HWID)*.
+
+🆔 Enviá tu *HWID* ahora para activar.
+
+${customDownloadText()}
+
+📌 (Enviá solo el código, sin espacios).`
+    );
+    await markPaymentAwaitHwid(p.external_reference);
+    continue;
+  }
+
+  const u = await createDbUser(p.phone, plan, appType);
+
+  let extra = "";
+  if (appType === "apk") {
+    const d = downloadsCfg();
+    if (d.apk_url) extra = `
+
+📲 Descarga APK:
+${d.apk_url}`;
+    else extra = `
+
+📲 Escribí *5* para descargar la app.`;
+  }
+
+  await safeSend(client, p.phone,
+    `✅ *TRANSFERENCIA APROBADA*
+
+👤 Usuario: *${u.username}*
+🔐 Pass: *${u.password}*
+📅 Expira: *${u.expires_at || "∞"}*${extra}`
+  );
+
+  await dbRun("UPDATE payments SET delivered=1 WHERE external_reference=?", [p.external_reference]);
+}
+} catch (e) {
       log(`Transfer deliver error: ${e && e.message ? e.message : e}`);
     }
   }
@@ -1064,6 +1239,10 @@ async function handleMessage(client, msg) {
   // Reload config (so panel edits apply without reinstall; restart still recommended)
   reloadConfig();
 
+  // HC/Custom: if there is an approved payment awaiting HWID, accept HWID now
+  if (await tryFinalizeHwidFlow(phone, msg, text)) return;
+
+
   // Quick menu
   if (lower === "menu" || lower === "start" || lower === "inicio" || lower === "hola" || lower === "hi") {
     resetSession(phone);
@@ -1258,29 +1437,82 @@ if (row.method === "transfer") {
     if (!app) return client.sendMessage(msg.from, "Elegí: 1/2/3");
     s.app = app;
 
-    // If test: directly create without MP
+    
+// If test: no payment, but for HC we must ask HWID first
     if (s.plan === "test") {
       if (app === "token") {
         const t = await createToken(phone, "test", 1);
         resetSession(phone);
         return client.sendMessage(msg.from,
-          `✅ *Test ${TEST_HOURS}h* listo.\n🔑 Token: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`
-        );
-      } else {
-        const u = await createDbUser(phone, "test", app);
-        resetSession(phone);
-        return client.sendMessage(msg.from,
-          `✅ *Test ${TEST_HOURS}h* listo.\n👤 Usuario: ${u.username}\n🔐 Pass: ${u.password}\n📅 Expira: ${u.expires_at || "∞"}` + (app === "hc" ? ("\n\n🆔 Enviá tu *HWID* para activar.\n\n" + customDownloadText()) : (app === "apk" ? (downloadsCfg().apk_url ? ("\n\n📲 Descarga APK: " + downloadsCfg().apk_url) : "\n\n📲 Escribí *5* para descargar la app.") : ""))
+          `✅ *Test ${TEST_HOURS}h* listo.\n🔑 Token: ${t.token}\n📅 Expira: ${t.expires_at || "∞"}\n\n📌 Escribí *menu* para ver opciones.`,
+          { sendSeen: false }
         );
       }
-    }
+      if (app === "hc") {
+        s.step = "await_hwid_test";
+        return client.sendMessage(
+          msg.from,
+          `🧩 Elegiste *Custom / HC (HWID)*.\n\n🆔 Enviá tu *HWID* ahora para generar tu usuario.\n\n(Enviá solo el código, sin espacios).`,
+          { sendSeen: false }
+        );
+      }
 
+      const u = await createDbUser(phone, "test", app);
+      resetSession(phone);
+      return client.sendMessage(
+        msg.from,
+        `✅ *Test ${TEST_HOURS}h* listo.\n👤 Usuario: ${u.username}\n🔐 Pass: ${u.password}\n📅 Expira: ${u.expires_at || "∞"}` +
+          (app === "apk"
+            ? (downloadsCfg().apk_url ? ("\n\n📲 Descarga APK: " + downloadsCfg().apk_url) : "\n\n📲 Escribí *5* para descargar la app.")
+            : ""),
+        { sendSeen: false }
+      );
+    }
 // Paid plans: elegir método de pago
 s.step = "choose_payment_method";
 const hint = MP_ENABLED ? "" : "\n\n⚠️ MercadoPago no está configurado en el servidor, usá *2) Transferencia*.";
 return client.sendMessage(msg.from, paymentMethodMenuText() + hint, { sendSeen: false });
 
   }
+
+// Step: awaiting HWID for TEST Custom/HC
+if (s.step === "await_hwid_test") {
+  const hwid = sanitizeHwid(text);
+  if (!hwid) {
+    return client.sendMessage(msg.from, "⚠️ HWID inválido. Enviá solo el código (sin espacios).", { sendSeen: false });
+  }
+  try {
+    const u = await createDbUserFromHwid(phone, "test", hwid);
+    resetSession(phone);
+
+    const hcPath = await getHcFilePath(hwid);
+    if (hcPath) {
+      try {
+        const media = MessageMedia.fromFilePath(hcPath);
+        await client.sendMessage(msg.from, media, { caption: `🧩 Archivo HC: ${path.basename(hcPath)}`, sendSeen: false });
+      } catch {}
+    }
+
+    return client.sendMessage(
+      msg.from,
+`✅ *Test ${TEST_HOURS}h* activado (Custom/HC)
+
+👤 Usuario: *${u.username}*
+🔐 Clave: *${u.password}*
+🆔 HWID: *${hwid}*
+⏳ Vence: *${moment(u.expires_at).format("DD/MM/YYYY HH:mm")}*
+
+${customDownloadText()}
+
+📌 Escribí *menu* para ver opciones.`,
+      { sendSeen: false }
+    );
+  } catch (e) {
+    resetSession(phone);
+    return client.sendMessage(msg.from, `❌ No pude activar el HWID: ${e.message}\n\nEscribí *menu* para reintentar.`, { sendSeen: false });
+  }
+}
+
 // Step: payment method
 if (s.step === "choose_payment_method") {
   const ans = lower;
@@ -1400,19 +1632,30 @@ function main() {
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: "ssh-bot", dataPath: BOT_HOME }),
     puppeteer: {
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-accelerated-2d-canvas",
-        "--no-first-run",
-        "--no-zygote",
-        "--single-process",
-        "--disable-gpu"
-      ]
-    }
+    headless: "new",
+    executablePath: cfg("paths.chromium", "/usr/bin/google-chrome"),
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--no-zygote",
+      "--disable-features=IsolateOrigins,site-per-process"
+    ]
+  }
   });
+
+// Make PM2 restart the bot if WhatsApp/Chromium throws fatal errors
+process.on("uncaughtException", (e) => {
+  log("uncaughtException: " + (e?.stack || e?.message || e));
+  process.exit(1);
+});
+process.on("unhandledRejection", (e) => {
+  log("unhandledRejection: " + (e?.stack || e?.message || e));
+  process.exit(1);
+});
+
 
   client.on("qr", (qr) => {
     log("QR generado. Guardando...");
@@ -1445,12 +1688,32 @@ client.on("authenticated", () => log("🔐 Autenticado."));
     try {
       // ignore groups
       if (msg.from && msg.from.endsWith("@g.us")) return;
+      try {
+        const b = (msg.body || "").toString().replace(/\s+/g," ").slice(0,200);
+        log(`📩 ${msg.from}: ${b}`);
+      } catch {}
       await handleMessage(client, msg);
     } catch (e) {
       log(`ERR: ${e && e.stack ? e.stack : e}`);
       try { await client.sendMessage(msg.from, "⚠️ Error interno. Intentá de nuevo en unos segundos."); } catch {}
     }
   });
+
+// Some WhatsApp versions trigger incoming messages via message_create; add a fallback
+client.on("message_create", async (msg) => {
+  try {
+    if (msg.fromMe) return;
+    if (msg.from && msg.from.endsWith("@g.us")) return;
+    try {
+      const b = (msg.body || "").toString().replace(/\s+/g," ").slice(0,200);
+      log(`📩(create) ${msg.from}: ${b}`);
+    } catch {}
+    await handleMessage(client, msg);
+  } catch (e) {
+    log("message_create error: " + (e?.message || e));
+  }
+});
+
 
 
   // Enforce max_connections (best effort) – checks sshd sessions per user
@@ -1550,7 +1813,7 @@ mkdir -p /usr/local/bin
 PANEL_LOCAL_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P 2>/dev/null || echo "")"
 PANEL_LOCAL="${PANEL_LOCAL_DIR}/panel_admin.sh"
 
-PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootsshx2/refs/heads/main/panel_admin.sh"
+PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootsshx2/refs/heads/main/install.sh"
 PANEL_URL="${PANEL_URL:-$PANEL_URL_DEFAULT}"
 
 PANEL_PATH="/usr/local/bin/panel_admin"
