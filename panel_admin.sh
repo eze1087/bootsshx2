@@ -157,6 +157,25 @@ set_json() {
   migrate_config
 }
 
+# Compat helpers (older code may call these names)
+cfg_set_json(){
+  # Usage: cfg_set_json '.path.key' '"value"'  or numeric/bool json
+  local key="$1"; shift || true
+  local val="$1"
+  [[ -n "$key" ]] || return 1
+  set_json "$key = $val"
+}
+
+cfg_set_str(){
+  # Usage: cfg_set_str '.path.key' 'value' (auto-JSON quotes)
+  local key="$1"; shift || true
+  local val="$*"
+  set_json "$key = \"$val\""
+}
+
+cfg_get(){ get_json "$1"; }
+
+
 ensure_config() {
   ensure_dirs
   if [[ ! -s "$CONFIG_FILE" ]]; then
@@ -330,6 +349,19 @@ reset_whatsapp_session() {
   rm -f "$QR_PNG" "$QR_TXT" >/dev/null 2>&1 || true
 }
 
+wait_for_qr(){
+  # Espera a que aparezca $QR_TXT o $QR_PNG (hasta N segundos)
+  local max_s=${1:-45}
+  local t=0
+  while (( t < max_s )); do
+    [[ -s "$QR_TXT" || -s "$QR_PNG" ]] && return 0
+    sleep 1
+    ((t++)) || true
+  done
+  return 1
+}
+
+
 show_qr_console() {
   # Solo mostrar QR en consola si NO hay PNG (evita doble QR)
   if [[ -s "$QR_PNG" ]]; then
@@ -348,24 +380,91 @@ show_qr_console() {
 show_qr_png() {
   if [[ -s "$QR_PNG" ]]; then
     echo -e "${GREEN}✅ PNG guardado: $QR_PNG${NC}"
+    # Preferir render nítido desde el texto QR si existe
+    if [[ -s "$QR_TXT" ]] && need_cmd qrencode; then
+      echo -e "${BOLD}🧾 QR nítido (qrencode)${NC}"
+      qrencode -t ANSIUTF8 < "$QR_TXT" 2>/dev/null || true
+      echo
+      return 0
+    fi
     if need_cmd chafa; then
-      chafa -s 70x40 "$QR_PNG" 2>/dev/null || true
-    elif need_cmd ; then -w 60 "$QR_PNG" 2>/dev/null || true
+      # Más grande para evitar 'borroso'
+      chafa -s 90x50 "$QR_PNG" 2>/dev/null || true
     else
-      echo -e "${YELLOW}No hay visor en terminal. Abrilo manualmente: ls -lah $QR_PNG${NC}"
+      echo -e "${YELLOW}No hay visor en terminal. Descargalo por SCP:${NC}"
+      echo -e "  scp root@$(get_json '.bot.server_ip'):$QR_PNG ."
     fi
   fi
 }
 
 ver_qr() {
-  header "📱 Ver QR actual"
-  echo "----------------------------------------"
-  if [[ -s "$QR_PNG" ]]; then
-    show_qr_png
-  else
-    show_qr_console
-  fi
-  pause
+  while true; do
+    header "📱 WhatsApp – QR / Vinculación"
+    echo "----------------------------------------"
+    echo "[1] Ver QR actual (sin borrar sesión)"
+    echo "[2] Forzar QR nuevo (borrar sesión + reiniciar)"
+    echo "[3] Ver logs (PM2)"
+    echo "[4] Borrar SOLO QR (png/txt)"
+    echo "[0] Volver"
+    echo
+    read -rp "Opción: " o
+    case "$o" in
+      1)
+        header "📱 Ver QR actual"
+        echo "----------------------------------------"
+        # Mostrar nítido: preferimos QR_TXT con qrencode, si no PNG
+        if [[ -s "$QR_TXT" ]] && need_cmd qrencode; then
+          echo -e "${BOLD}🧾 QR nítido (qrencode)${NC}"
+          qrencode -t ANSIUTF8 < "$QR_TXT" 2>/dev/null || true
+          echo
+        else
+          # Si existe PNG, intentar mostrarlo
+          show_qr_png
+          # Si no hay PNG, intentar consola (pero NO mostrar logs si ya hay QR_TXT)
+          if [[ ! -s "$QR_PNG" ]]; then
+            show_qr_console
+          fi
+        fi
+        pause
+        ;;
+      2)
+        header "📱 Forzar QR NUEVO"
+        echo "----------------------------------------"
+        echo -e "${YELLOW}⚠️  Esto borra sesión y fuerza un QR NUEVO.${NC}"
+        echo
+        reset_whatsapp_session
+        echo -e "${YELLOW}🔁 Reiniciando bot...${NC}"
+        if pm2_run describe "$BOT_NAME" >/dev/null 2>&1; then
+          pm2_run restart "$BOT_NAME" >/dev/null 2>&1 || true
+        else
+          pm2_run start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true
+        fi
+        pm2_run save >/dev/null 2>&1 || true
+        echo -e "${YELLOW}⏳ Esperando QR (hasta 60s)...${NC}"
+        if wait_for_qr 60; then
+          echo -e "${GREEN}✅ QR generado.${NC}"
+        else
+          echo -e "${RED}❌ No apareció QR a tiempo.${NC}"
+          echo -e "${YELLOW}Probá ver logs (opción 3).${NC}"
+        fi
+        echo
+        pause
+        ;;
+      3)
+        pm2_run logs "$BOT_NAME" --lines 250
+        pause
+        ;;
+      4)
+        header "🧹 Borrar QR (png/txt)"
+        echo "----------------------------------------"
+        rm -f "$QR_PNG" "$QR_TXT" >/dev/null 2>&1 || true
+        echo -e "${GREEN}✅ QR borrado. (No borra sesión)${NC}"
+        pause
+        ;;
+      0) return ;;
+      *) echo -e "${RED}❌ Opción inválida${NC}"; sleep 1 ;;
+    esac
+  done
 }
 
 # ---------- MERCADOPAGO ----------
@@ -1246,5 +1345,9 @@ main_menu() {
     esac
   done
 }
+
+
+# Asegurar runtime (node/pm2) para que el panel siempre funcione
+ensure_runtime
 
 main_menu
