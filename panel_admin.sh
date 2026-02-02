@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -12,6 +13,8 @@ QR_TXT="/root/qr-whatsapp.txt"
 
 APK_DIR="$BOT_HOME/apks"
 HC_DIR="$BOT_HOME/hc"
+HC_TEMPLATE_DIR="/root"
+HC_ACTIVE_KEY=".downloads.hc_template"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -46,21 +49,7 @@ pausa(){ read -rp "Presioná ENTER para continuar..." _ || true; }
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 PM2_BIN=""
-pm2_resolve(){
-  # Try common locations for npm global bin
-  PM2_BIN="$(command -v pm2 2>/dev/null || true)";
-  if [[ -z "${PM2_BIN}" ]]; then
-    for p in /usr/local/bin/pm2 /usr/bin/pm2 /opt/nvm/*/bin/pm2; do
-      [[ -x "$p" ]] && PM2_BIN="$p" && break
-    done
-  fi
-  if [[ -z "${PM2_BIN}" ]] && command -v npm >/dev/null 2>&1; then
-    local nb
-    nb="$(npm bin -g 2>/dev/null || true)"
-    [[ -n "$nb" && -x "$nb/pm2" ]] && PM2_BIN="$nb/pm2"
-  fi
-}
-
+pm2_resolve(){ PM2_BIN="$(command -v pm2 2>/dev/null || true)"; }
 pm2_run(){
   pm2_resolve
   if [[ -n "${PM2_BIN}" ]]; then
@@ -154,6 +143,7 @@ migrate_config() {
   chmod 600 "$CONFIG_FILE" || true
   mkdir -p "$BOT_HOME/config" >/dev/null 2>&1 || true
   cp -f "$CONFIG_FILE" "$BOT_HOME/config/config.json" >/dev/null 2>&1 || true
+  migrate_config
 }
 
 
@@ -342,6 +332,10 @@ reset_whatsapp_session() {
 }
 
 show_qr_console() {
+  # Solo mostrar QR en consola si NO hay PNG (evita doble QR)
+  if [[ -s "$QR_PNG" ]]; then
+    return 0
+  fi
   echo -e "${BOLD}🧾 QR en consola${NC}"
   echo
   if [[ -s "$QR_TXT" ]] && need_cmd qrencode; then
@@ -400,8 +394,8 @@ ver_qr() {
         fi
         pm2_run save >/dev/null 2>&1 || true
 
-        echo -e "${CYAN}⏳ Esperando QR (hasta 45s)...${NC}"
-        for i in {1..45}; do
+        echo -e "${CYAN}⏳ Esperando QR (hasta 120s)...${NC}"
+        for i in {1..120}; do
           [[ -s "$QR_TXT" || -s "$QR_PNG" ]] && break
           sleep 1
         done
@@ -571,34 +565,115 @@ hc_menu() {
   while true; do
     clear
     echo -e "${CYAN}${BOLD}🧩 Gestión .hc (HWID)${NC}"
-    echo "[1] Listar .hc"
-    echo "[2] Crear .hc manual (por HWID)"
-    echo "[3] Borrar .hc"
+    echo "[1] Listar .hc (plantillas en /root + generado por HWID)"
+    echo "[2] Seleccionar .hc ACTIVO (plantilla en /root)"
+    echo "[3] Importar .hc desde /root (solo seleccionar)"
+    echo "[4] Crear .hc manual (por HWID)"
+    echo "[5] Borrar .hc"
     echo "[0] Volver"
     read -rp "Opción: " o
     case "$o" in
-      1)
-        ls -lah "$HC_DIR"/*.hc 2>/dev/null || echo "No hay .hc."
+1)
+  echo -e "${YELLOW}📌 Plantillas (.hc) en /root:${NC}"
+  ls -lah "$HC_TEMPLATE_DIR"/*.hc 2>/dev/null || echo "No hay plantillas .hc en /root."
+  echo
+  echo -e "${YELLOW}📌 Generados por HWID (bot):${NC}"
+  ls -lah "$HC_DIR"/*.hc 2>/dev/null || echo "No hay .hc generados."
+  echo
+  local active
+  active=$(jq -r "$HC_ACTIVE_KEY" "$CONFIG_FILE" 2>/dev/null || echo "")
+  [[ "$active" == "null" ]] && active=""
+  echo -e "${CYAN}HC activo:${NC} ${active:-"(no configurado)"}"
+  pausa
+  ;;
+2)
+  echo -e "${CYAN}${BOLD}✅ Seleccionar .hc ACTIVO (plantilla)${NC}"
+  echo -e "${YELLOW}Subí tu .hc a /root y elegilo de la lista.${NC}"
+  mapfile -t files < <(ls -1 "$HC_TEMPLATE_DIR"/*.hc 2>/dev/null || true)
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "No hay .hc en /root."
+    pausa
+    continue
+  fi
+  echo
+  for i in "${!files[@]}"; do
+    echo "[$((i+1))] ${files[$i]}"
+  done
+  echo "[0] Cancelar"
+  read -rp "Elegí: " sel
+  if [[ "$sel" == "0" ]]; then
         pausa
-        ;;
-      2)
-        read -rp "HWID: " hw
-        [[ -z "$hw" ]] && { echo "Cancelado."; pausa; continue; }
-        fp="$HC_DIR/$hw.hc"
-        echo "HWID=$hw" > "$fp"
-        echo -e "${GREEN}✅ Creado: $fp${NC}"
-        pausa
-        ;;
-      3)
-        ls -1 "$HC_DIR"/*.hc 2>/dev/null || { echo "No hay .hc."; pausa; continue; }
-        read -rp "Nombre exacto a borrar (ej: ABC.hc): " name
-        [[ -z "$name" ]] && { echo "Cancelado."; pausa; continue; }
-        rm -f "$HC_DIR/$name" >/dev/null 2>&1 || true
+        continue
+      fi
+  if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#files[@]} )); then
+    chosen="${files[$((sel-1))]}"
+    cfg_set_json "$HC_ACTIVE_KEY" "\"$chosen\""
+    echo -e "${GREEN}✅ HC activo seteado:${NC} $chosen"
+  else
+    echo "Opción inválida."
+  fi
+  pausa
+  ;;
+3)
+  echo -e "${CYAN}${BOLD}📥 Importar .hc desde /root${NC}"
+  echo -e "${YELLOW}Esto NO crea nada manualmente: solo toma un archivo existente en /root y lo deja como ACTIVO.${NC}"
+  echo -e "Subí tu archivo a /root (SCP/SFTP) y luego usá la opción [2]."
+  pausa
+  ;;
+4)
+  read -rp "HWID: " hw
+  [[ -z "$hw" ]] && { echo "HWID vacío"; pausa; continue; }
+  read -rp "USER (vacío=HWID): " u
+  read -rp "PASS (vacío=HWID): " p
+  [[ -z "$u" ]] && u="$hw"
+  [[ -z "$p" ]] && p="$hw"
+  mkdir -p "$HC_DIR"
+  fp="$HC_DIR/${hw}.hc"
+  echo -e "HWID=${hw}\nUSER=${u}\nPASS=${p}\n" > "$fp"
+  chmod 600 "$fp"
+  echo -e "${GREEN}✅ Creado:${NC} $fp"
+  pausa
+  ;;
+5)
+  echo -e "${CYAN}${BOLD}🗑️ Borrar .hc${NC}"
+  echo "[1] Borrar plantilla en /root"
+  echo "[2] Borrar generado por HWID (bot)"
+  echo "[0] Cancelar"
+  read -rp "Elegí: " which
+  case "$which" in
+    1)
+      mapfile -t files < <(ls -1 "$HC_TEMPLATE_DIR"/*.hc 2>/dev/null || true)
+      [[ "${#files[@]}" -eq 0 ]] && { echo "No hay plantillas."; pausa; break; }
+      for i in "${!files[@]}"; do echo "[$((i+1))] ${files[$i]}"; done
+      echo "[0] Cancelar"
+      read -rp "Elegí: " sel
+      [[ "$sel" == "0" ]] && { pausa; break; }
+      if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#files[@]} )); then
+        rm -f "${files[$((sel-1))]}"
         echo "OK"
-        pausa
-        ;;
-      0) return ;;
-      *) echo "Inválido"; sleep 1 ;;
+      else
+        echo "Inválido"
+      fi
+      pausa
+      ;;
+    2)
+      mapfile -t files < <(ls -1 "$HC_DIR"/*.hc 2>/dev/null || true)
+      [[ "${#files[@]}" -eq 0 ]] && { echo "No hay generados."; pausa; break; }
+      for i in "${!files[@]}"; do echo "[$((i+1))] ${files[$i]}"; done
+      echo "[0] Cancelar"
+      read -rp "Elegí: " sel
+      [[ "$sel" == "0" ]] && { pausa; break; }
+      if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#files[@]} )); then
+        rm -f "${files[$((sel-1))]}"
+        echo "OK"
+      else
+        echo "Inválido"
+      fi
+      pausa
+      ;;
+    *) pausa ;;
+  esac
+  ;;
     esac
   done
 }
@@ -1041,7 +1116,7 @@ transfer_menu() {
       3)
         header "📋 Pagos pendientes - Transferencias"
         ensure_db
-        sqlite3 -header -column "$DB_FILE" "SELECT external_reference AS REF, substr(phone,1,15) AS TEL, plan AS PLAN, app_type AS APP, amount AS MONTO, status AS ESTADO, created_at AS FECHA FROM payments WHERE method='transfer' AND status='pending_admin' ORDER BY id DESC LIMIT 50;" 2>/dev/null || true
+        sqlite3 -header -column "$DB" "SELECT external_reference AS REF, substr(phone,1,15) AS TEL, plan AS PLAN, app_type AS APP, amount AS MONTO, status AS ESTADO, created_at AS FECHA FROM payments WHERE method='transfer' AND status='pending_admin' ORDER BY id DESC LIMIT 50;" 2>/dev/null || true
         echo ""
         echo "Tip: confirmá desde [4] con la REF."
         pause
@@ -1050,7 +1125,7 @@ transfer_menu() {
         ensure_db
         read -rp "REF a confirmar: " ref
         [[ -z "$ref" ]] && continue
-        sqlite3 "$DB_FILE" "UPDATE payments SET status='approved', approved_at=datetime('now') WHERE external_reference='$ref' AND method='transfer' AND status='pending_admin';" 2>/dev/null || true
+        sqlite3 "$DB" "UPDATE payments SET status='approved', approved_at=datetime('now') WHERE external_reference='$ref' AND method='transfer' AND status='pending_admin';" 2>/dev/null || true
         ok "Marcado como APPROVED. El bot entregará automáticamente en 1-2 min."
         pause
         ;;
@@ -1058,7 +1133,7 @@ transfer_menu() {
         ensure_db
         read -rp "REF a rechazar/borrar: " ref
         [[ -z "$ref" ]] && continue
-        sqlite3 "$DB_FILE" "UPDATE payments SET status='rejected' WHERE external_reference='$ref' AND method='transfer' AND status='pending_admin';" 2>/dev/null || true
+        sqlite3 "$DB" "UPDATE payments SET status='rejected' WHERE external_reference='$ref' AND method='transfer' AND status='pending_admin';" 2>/dev/null || true
         ok "Marcado como REJECTED."
         pause
         ;;
@@ -1198,7 +1273,6 @@ main_menu() {
     echo "[10] 🔁 Migrar usuario -> Token"
     echo "[11] 🔄 Update (npm install + restart)"
     echo "[12] ⚙️ Ajustes (Soporte / IA / Descargas)"
-    echo "[13] 🏦 Transferencias (alias/CBU + confirmar pagos)"
     echo "[0] 🚪 Salir"
     echo
     read -rp "Opción: " opt
