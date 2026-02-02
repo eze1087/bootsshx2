@@ -271,6 +271,7 @@ function loadConfig() {
 }
 
 let { config, path: configPath } = loadConfig();
+let READY = false;
 
 function reloadConfig() {
   const r = loadConfig();
@@ -467,6 +468,18 @@ function log(msg) {
   console.log(line);
   try { fs.appendFileSync(path.join(INSTALL_DIR, "logs", "bot.log"), line + "\n"); } catch {}
 }
+
+// Hardening: crash/restart on known puppeteer init issue
+process.on("unhandledRejection", (err) => {
+  const m = (err && err.message) ? err.message : String(err || "");
+  log("❌ unhandledRejection: " + m);
+  if (m.includes("Requesting main frame too early")) process.exit(1);
+});
+process.on("uncaughtException", (err) => {
+  const m = (err && err.message) ? err.message : String(err || "");
+  log("❌ uncaughtException: " + m);
+  if (m.includes("Requesting main frame too early")) process.exit(1);
+});
 
 function chatIdFromPhone(phone) {
   const p = String(phone || "").trim();
@@ -1637,11 +1650,7 @@ function main() {
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-software-rasterizer",
-      "--no-zygote",
-      "--disable-features=IsolateOrigins,site-per-process"
+      "--disable-dev-shm-usage"
     ]
   }
   });
@@ -1664,6 +1673,7 @@ process.on("unhandledRejection", (e) => {
   });
 
   client.on("ready", () => {
+    READY = true;
     log("✅ WhatsApp listo.");
     try { fs.unlinkSync(QR_TXT); } catch {}
     try { fs.unlinkSync(QR_PNG); } catch {}
@@ -1743,6 +1753,14 @@ client.on("message_create", async (msg) => {
 
   setInterval(enforceConnections, 30000);
   setTimeout(enforceConnections, 8000);
+  // Watchdog: si no llega 'ready' en 120s, reiniciar (PM2 lo levanta)
+  setTimeout(() => {
+    if (!READY) {
+      log("⚠️ Watchdog: no llegó 'ready' en 120s. Reiniciando proceso...");
+      process.exit(1);
+    }
+  }, 120000);
+
   client.initialize();
 }
 
