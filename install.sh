@@ -1813,7 +1813,7 @@ mkdir -p /usr/local/bin
 PANEL_LOCAL_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P 2>/dev/null || echo "")"
 PANEL_LOCAL="${PANEL_LOCAL_DIR}/panel_admin.sh"
 
-PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootsshx2/refs/heads/main/install.sh"
+PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootsshx2/refs/heads/main/panel_admin.sh"
 PANEL_URL="${PANEL_URL:-$PANEL_URL_DEFAULT}"
 
 PANEL_PATH="/usr/local/bin/panel_admin"
