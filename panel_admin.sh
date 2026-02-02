@@ -143,7 +143,6 @@ migrate_config() {
   chmod 600 "$CONFIG_FILE" || true
   mkdir -p "$BOT_HOME/config" >/dev/null 2>&1 || true
   cp -f "$CONFIG_FILE" "$BOT_HOME/config/config.json" >/dev/null 2>&1 || true
-  migrate_config
 }
 
 
@@ -359,62 +358,14 @@ show_qr_png() {
 }
 
 ver_qr() {
-  while true; do
-    clear
-    echo -e "${CYAN}${BOLD}📱 WhatsApp – QR / Vinculación${NC}"
-    echo "----------------------------------------"
-    echo "[1] Ver QR actual (sin borrar sesión)"
-    echo "[2] Forzar QR nuevo (borrar sesión + reiniciar)"
-    echo "[3] Ver logs (PM2)"
-    echo "[0] Volver"
-    echo
-    read -rp "Opción: " q
-    case "$q" in
-      1)
-        echo
-        echo -e "${CYAN}🧾 Mostrando QR (si está disponible)...${NC}"
-        echo
-        show_qr_console || true
-        echo
-        show_qr_png || true
-        pausa
-        ;;
-      2)
-        clear
-        echo -e "${CYAN}${BOLD}📱 Forzar QR NUEVO${NC}"
-        echo "----------------------------------------"
-        echo -e "${YELLOW}⚠️  Esto borra sesión y fuerza un QR NUEVO.${NC}"
-        echo
-        reset_whatsapp_session
-        echo -e "${CYAN}🔁 Reiniciando bot...${NC}"
-        if pm2_run describe "$BOT_NAME" >/dev/null 2>&1; then
-          pm2_run restart "$BOT_NAME" >/dev/null 2>&1 || true
-        else
-          pm2_run start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true
-        fi
-        pm2_run save >/dev/null 2>&1 || true
-
-        echo -e "${CYAN}⏳ Esperando QR (hasta 120s)...${NC}"
-        for i in {1..120}; do
-          [[ -s "$QR_TXT" || -s "$QR_PNG" ]] && break
-          sleep 1
-        done
-        echo
-        show_qr_console || true
-        echo
-        show_qr_png || true
-        echo
-        echo -e "${CYAN}👉 Escanealo desde tu WhatsApp principal: Dispositivos vinculados.${NC}"
-        pausa
-        ;;
-      3)
-        pm2_run logs "$BOT_NAME" --lines 220
-        pausa
-        ;;
-      0) return ;;
-      *) echo "Opción inválida"; sleep 1 ;;
-    esac
-  done
+  header "📱 Ver QR actual"
+  echo "----------------------------------------"
+  if [[ -s "$QR_PNG" ]]; then
+    show_qr_png
+  else
+    show_qr_console
+  fi
+  pause
 }
 
 # ---------- MERCADOPAGO ----------
