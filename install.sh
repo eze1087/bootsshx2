@@ -91,6 +91,10 @@ apt-get install -y -qq \
   ca-certificates gnupg \
   software-properties-common \
   libgbm-dev libxshmfence-dev \
+  # deps típicas para Chromium/Puppeteer (Ubuntu 22/24)
+  libnss3 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
+  libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+  libgtk-3-0 libasound2 fonts-liberation xdg-utils \
   sshpass at >/dev/null 2>&1 || true
 
 # Extras (no romper si no existen en el repo)
@@ -147,6 +151,11 @@ if [[ ! -s "$CONFIG_FILE" ]]; then
     "apk_url": "",
     "custom_url": "",
     "custom_message": "📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá."
+  },
+  "paths": {
+    "chromium": "/usr/bin/google-chrome",
+    "database": "${DB_FILE}",
+    "qr_codes": "${INSTALL_DIR}/qr_codes"
   }
 }
 EOF
@@ -230,6 +239,9 @@ const qrcode = require("qrcode");
 const qrcodeTerminal = require("qrcode-terminal");
 
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
+// puppeteer-core es provisto internamente por whatsapp-web.js
+// NO instalar puppeteer separado: genera mismatch de Chromium con Ubuntu 22/24
+// que provoca "Requesting main frame too early" y el bot no responde mensajes
 
 const ROOT = "/root";
 const INSTALL_DIR = "/opt/ssh-bot";
@@ -238,6 +250,24 @@ const DB_FILE = path.join(INSTALL_DIR, "data", "users.db");
 
 const QR_TXT = path.join(ROOT, "qr-whatsapp.txt");
 const QR_PNG = path.join(ROOT, "qr-whatsapp.png");
+
+function resolveChromePath(cfg) {
+  // Prioridad: config.paths.chromium -> env -> sistema
+  // NO usar puppeteer bundled: versión nueva de puppeteer es incompatible con whatsapp-web.js 1.24
+  const fromCfg = cfg?.paths?.chromium;
+  if (fromCfg && fs.existsSync(fromCfg)) return fromCfg;
+  const env = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
+  if (env && fs.existsSync(env)) return env;
+  // Fallbacks sistema
+  const candidates = [
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium"
+  ];
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  return null;
+}
 
 const CONFIG_CANDIDATES = [
   path.join(BOT_HOME, "config", "config.json"),
@@ -657,7 +687,6 @@ async function ensurePaymentsColumns() {
       try { await dbRun(sql, []); } catch {}
     }
   } catch {}
-  await ensureColumn("payments", "hwid", "TEXT");
 }
 
 function mpHeaders() {
@@ -1055,127 +1084,6 @@ async function handleAdminCommand(client, msg, phone, text) {
   return client.sendMessage(msg.from, "Admin: comandos: admin usuarios | admin borrar <user> | admin tokens | admin revocar <token>");
 }
 
-        function sanitizeHwidToUsername(input) {
-          const raw = String(input || "").trim();
-          // permitir letras, números, guion y guion bajo
-          let u = raw.replace(/[^a-zA-Z0-9_-]/g, "");
-          if (!u) return null;
-          if (u.length > 32) u = u.slice(0, 32);
-          // linux user: no empezar con guion
-          u = u.replace(/^-+/, "");
-          return u || null;
-        }
-
-        async function upsertLinuxUser(username, password, days) {
-          // Crear si no existe; si existe, actualizar clave y vencimiento
-          const userExists = await execPromise(`id -u ${username} >/dev/null 2>&1 && echo yes || echo no`).then(r => r.stdout.trim()==="yes").catch(() => false);
-
-          const expireDate = days > 0
-            ? fmtDateISO(addDays(now(), days)) // YYYY-MM-DD
-            : null;
-
-          if (!userExists) {
-            if (days > 0) {
-              await execPromise(`useradd -M -s /bin/false -e ${expireDate} ${username}`);
-            } else {
-              await execPromise(`useradd -m -s /bin/bash ${username}`);
-            }
-          } else if (days > 0 && expireDate) {
-            await execPromise(`usermod -e ${expireDate} ${username}`);
-          }
-
-          await execPromise(`echo "${username}:${password}" | chpasswd`);
-        }
-
-        async function deliverHcFromHwid(phone, hwidText, days, plan) {
-          const hwid = sanitizeHwidToUsername(hwidText);
-          if (!hwid) return { ok:false, error:"HWID inválido. Enviá solo letras/números (y - _ si corresponde)." };
-
-          // Usuario y clave = HWID
-          await upsertLinuxUser(hwid, hwid, days);
-
-          // Registrar en DB
-          const expiresAt = days > 0 ? fmtDateTime(addDays(now(), days), true) : fmtDateTime(addHours(now(), 2), false);
-          await dbRun(
-            "INSERT INTO users (phone, username, password, tipo, expires_at, max_connections, status) VALUES (?, ?, ?, ?, ?, 1, 1)",
-            [phone, hwid, hwid, plan === "test" ? "test" : "premium", expiresAt]
-          ).catch(async () => {
-            // si ya existe, actualizar
-            await dbRun("UPDATE users SET phone=?, password=?, tipo=?, expires_at=?, status=1 WHERE username=?", [phone, hwid, plan === "test" ? "test":"premium", expiresAt, hwid]).catch(()=>{});
-          });
-
-          // Generar .hc desde plantilla configurada
-          const cfg = loadConfigSafe();
-          const template = cfg?.downloads?.hc_template || "/root/hwid.hc";
-          const outDir = "/root/ssh-bot/hc";
-          try { await execPromise(`mkdir -p ${outDir}`); } catch(e) {}
-
-          const outFile = `${outDir}/${hwid}.hc`;
-          try {
-            const fs = require("fs");
-            if (template && fs.existsSync(template)) {
-              fs.copyFileSync(template, outFile);
-            } else {
-              fs.writeFileSync(outFile, `# HTTP Custom\n# HWID: ${hwid}\n`, "utf8");
-            }
-          } catch (e) {
-            // ignore file errors; still deliver credentials
-          }
-
-          return { ok:true, username: hwid, password: hwid, hcFile: outFile };
-        }
-
-        async function maybeHandleAwaitingHwid(client, phone, text) {
-          const pending = await dbGet(
-            "SELECT id, plan, days, app_type FROM payments WHERE phone=? AND status='awaiting_hwid' AND delivered=0 ORDER BY id DESC LIMIT 1",
-            [phone]
-          ).catch(() => null);
-
-          if (!pending) return false;
-
-          const hwid = sanitizeHwidToUsername(text);
-          if (!hwid || hwid.length < 6) {
-            await safeSend(client, phone, "🆔 Enviá tu *HWID* (mínimo 6 caracteres).");
-            return true;
-          }
-
-          const days = Number(pending.days) || 0;
-          const plan = pending.plan || "premium";
-
-          const res = await deliverHcFromHwid(phone, hwid, days, plan);
-          if (!res.ok) {
-            await safeSend(client, phone, `⚠️ ${res.error}`);
-            return true;
-          }
-
-          // Marcar como entregado
-          await dbRun("UPDATE payments SET status='approved', delivered=1, hwid=? WHERE id=?", [hwid, pending.id]).catch(()=>{});
-
-          // Intentar enviar archivo .hc
-          let sent = false;
-          try {
-            const media = MessageMedia.fromFilePath(res.hcFile);
-            await client.sendMessage(phone, media);
-            sent = true;
-          } catch (e) {}
-
-          const cfg = loadConfigSafe();
-          const msg = cfg?.downloads?.custom_message || "📲 Descargá tu Custom/HTTP";
-          const url = cfg?.downloads?.custom_url || "";
-
-          await safeSend(client, phone,
-`✅ *ACCESO GENERADO*
-👤 Usuario: *${res.username}*
-🔑 Clave: *${res.password}*
-
-🧩 *HTTP Custom (.hc)*: ${sent ? "✅ Archivo enviado" : "⚠️ No pude adjuntar el archivo, usá el link/mensaje configurado."}
-${msg}${url ? "\n" + url : ""}
-
-📌 Escribí *menu* para más opciones.`);
-
-          return true;
-        }
-
 async function handleMessage(client, msg) {
   const phone = normalizeNumber(msg.from);
   const text = (msg.body || "").trim();
@@ -1519,10 +1427,23 @@ function main() {
   log(`DB: ${DB_FILE}`);
   log(`MercadoPago: ${MP_ENABLED ? "ON" : "OFF"}`);
 
+  const chromePath = resolveChromePath(config);
+  if (!chromePath) {
+    log("❌ FATAL: No se encontró Google Chrome. Instalá: wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && apt install ./google-chrome-stable_current_amd64.deb");
+    process.exit(1);
+  }
+  log(`🌐 Chrome: ${chromePath}`);
+
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: "ssh-bot", dataPath: BOT_HOME }),
+    authTimeoutMs: 0,
+    qrMaxRetries: 10,
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
     puppeteer: {
-      headless: true,
+      headless: "new",
+      executablePath: chromePath,
+      timeout: 60000,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -1530,8 +1451,8 @@ function main() {
         "--disable-accelerated-2d-canvas",
         "--no-first-run",
         "--no-zygote",
-        "--single-process",
-        "--disable-gpu"
+        "--disable-gpu",
+        "--single-process"
       ]
     }
   });
@@ -1547,16 +1468,17 @@ function main() {
     try { fs.unlinkSync(QR_TXT); } catch {}
     try { fs.unlinkSync(QR_PNG); } catch {}
 
-    // Auto-verificación MercadoPago (cada 2 min) – mantiene el comando "verificar <REF>"
+    // Auto-verificación MercadoPago (cada 2 min)
     if (MP_ENABLED) {
       log("💳 MercadoPago: verificación automática cada 2 minutos.");
       setTimeout(() => { mpProcessPendingPayments(client).catch(()=>{}); }, 8000);
       setInterval(() => { mpProcessPendingPayments(client).catch(()=>{}); }, 120000);
-// Transferencias: entregar pagos confirmados por admin + recordatorios
-setTimeout(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 12000);
-setInterval(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 60000);
-setInterval(() => { transferSendReminders(client).catch(()=>{}); }, 60000);
     }
+
+    // Transferencias: siempre activas (entregar confirmados + recordatorios)
+    setTimeout(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 12000);
+    setInterval(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 60000);
+    setInterval(() => { transferSendReminders(client).catch(()=>{}); }, 60000);
   });
 
 client.on("authenticated", () => log("🔐 Autenticado."));
@@ -1567,6 +1489,9 @@ client.on("authenticated", () => log("🔐 Autenticado."));
     try {
       // ignore groups
       if (msg.from && msg.from.endsWith("@g.us")) return;
+      const from = msg.from || "";
+      const body = (msg.body || "").toString();
+      log(`MSG from=${from} body=${JSON.stringify(body).slice(0, 300)}`);
       await handleMessage(client, msg);
     } catch (e) {
       log(`ERR: ${e && e.stack ? e.stack : e}`);
@@ -1626,7 +1551,7 @@ cat > "$BOT_HOME/package.json" <<'EOF'
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "sqlite3": "^5.1.7",
-    "whatsapp-web.js": "^1.24.0"
+    "whatsapp-web.js": "1.24.0"
   }
 }
 EOF
@@ -1635,16 +1560,18 @@ cd "$BOT_HOME"
 npm cache clean --force >/dev/null 2>&1 || true
 npm install --silent >/dev/null 2>&1 || true
 
-# Parche whatsapp-web.js (anti-markedUnread) – best-effort
-# 1) Ajuste simple (cuando existe la clave markedUnread)
+# ✅ Parche whatsapp-web.js (anti-markedUnread) – MISMO FIX que v8.6 funcional
+# 1) markedUnread: true → false
 find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
   sed -i "s/markedUnread: true/markedUnread: false/g" {} \; 2>/dev/null || true
-# 2) Fallback defensivo (algunas versiones traen el if(chat && chat.markedUnread))
+# 2) if(chat && chat.markedUnread) → if(false && ...)
 find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
-  sed -i "s/if (chat && chat.markedUnread)/if (false \\&\\& chat.markedUnread)/g" {} \; 2>/dev/null || true
-# 3) Fallback extra (deshabilitar sendSeen si tu build lo usa y rompe por markedUnread)
+  sed -i 's/if (chat && chat.markedUnread)/if (false \&\& chat.markedUnread)/g' {} \; 2>/dev/null || true
+# 3) Deshabilitar sendSeen por completo (causa crash silencioso al responder)
 find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
-  sed -i "s/const sendSeen = async (chatId) => {/const sendSeen = async (chatId) => { console.log(\\"[DEBUG] sendSeen deshabilitado\\"); return; /g" {} \; 2>/dev/null || true
+  sed -i 's/const sendSeen = async (chatId) => {/const sendSeen = async (chatId) => { console.log("[PATCH] sendSeen disabled"); return;/g' {} \; 2>/dev/null || true
+
+echo -e "${GREEN}✅ Parche markedUnread+sendSeen aplicado${NC}"
 
 # Auto-refresh cada 2 horas
 ( crontab -l 2>/dev/null | grep -v 'ssh-bot-refresh' ) | crontab - || true
@@ -1667,22 +1594,22 @@ echo -e "${CYAN}${BOLD}📊 Instalando panel admin (sshbot)...${NC}"
 mkdir -p /usr/local/bin
 
 # ✅ Panel separado para evitar scripts gigantes y errores de pegado.
-# Si existe panel_admin.sh en el mismo directorio del instalador, lo usa.
+# Si existe backendmgr.sh en el mismo directorio del instalador, lo usa.
 # Si no, lo descarga desde GitHub (PANEL_URL).
 PANEL_LOCAL_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P 2>/dev/null || echo "")"
-PANEL_LOCAL="${PANEL_LOCAL_DIR}/panel_admin.sh"
+PANEL_LOCAL="${PANEL_LOCAL_DIR}/backendmgr.sh"
 
-PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootsshx2/refs/heads/main/panel_admin.sh"
+PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootssh.8.27/main/backendmgr.sh"
 PANEL_URL="${PANEL_URL:-$PANEL_URL_DEFAULT}"
 
-PANEL_PATH="/usr/local/bin/panel_admin"
+PANEL_PATH="/usr/local/bin/backendmgr"
 
 if [[ -n "$PANEL_LOCAL_DIR" && -f "$PANEL_LOCAL" ]]; then
   cp -f "$PANEL_LOCAL" "$PANEL_PATH"
 else
   (curl -fsSL "$PANEL_URL" -o "$PANEL_PATH" || wget -qO "$PANEL_PATH" "$PANEL_URL") || {
     echo -e "${RED}❌ ERROR: No se pudo descargar el panel admin.${NC}"
-    echo -e "${YELLOW}➡️ Subí panel_admin.sh al repo y verificá PANEL_URL.${NC}"
+    echo -e "${YELLOW}➡️ Subí backendmgr.sh al repo y verificá PANEL_URL.${NC}"
     exit 1
   }
 fi
