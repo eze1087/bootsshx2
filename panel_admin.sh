@@ -129,11 +129,10 @@ migrate_config() {
     .links.support //= "https://t.me/soporte" |
     .links.support_whatsapp //= "" |
     .links.telegram //= "" |
-    .downloads //= {"apk_url":"","custom_url":"","custom_message":"📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá.","hc_template":""} |
+    .downloads //= {"apk_url":"","custom_url":"","custom_message":"📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá."} |
     .downloads.apk_url //= "" |
     .downloads.custom_url //= "" |
     .downloads.custom_message //= "📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá." |
-    .downloads.hc_template //= "" |
     .transfer //= {"enabled":true,"titular":"","alias":"","cbu":"","admin_whatsapp":""} |
     .transfer.enabled //= true |
     .transfer.titular //= "" |
@@ -158,22 +157,23 @@ set_json() {
   migrate_config
 }
 
-
-cfg_set_json() {
-  # Uso: cfg_set_json '.ruta' 'valor'
-  local jq_path="${1:-}"
-  local value="${2-}"
-  [[ -z "$jq_path" ]] && return 1
-  local tmp; tmp="$(mktemp)"
-  if [[ "$value" == "true" || "$value" == "false" || "$value" =~ ^[0-9]+$ ]]; then
-    jq "$jq_path = $value" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-  else
-    jq --arg v "$value" "$jq_path = $v" "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
-  fi
-  chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-  mkdir -p "$BOT_HOME/config" >/dev/null 2>&1 || true
-  cp -f "$CONFIG_FILE" "$BOT_HOME/config/config.json" >/dev/null 2>&1 || true
+# Compat helpers (older code may call these names)
+cfg_set_json(){
+  # Usage: cfg_set_json '.path.key' '"value"'  or numeric/bool json
+  local key="$1"; shift || true
+  local val="$1"
+  [[ -n "$key" ]] || return 1
+  set_json "$key = $val"
 }
+
+cfg_set_str(){
+  # Usage: cfg_set_str '.path.key' 'value' (auto-JSON quotes)
+  local key="$1"; shift || true
+  local val="$*"
+  set_json "$key = \"$val\""
+}
+
+cfg_get(){ get_json "$1"; }
 
 
 ensure_config() {
@@ -349,17 +349,20 @@ reset_whatsapp_session() {
   rm -f "$QR_PNG" "$QR_TXT" >/dev/null 2>&1 || true
 }
 
-show_qr_best() {
-  # Preferir imagen; si no existe, usar texto
-  if [[ -s "$QR_PNG" ]]; then
-    show_qr_png && return 0
-  fi
-  show_qr_console && return 0
+wait_for_qr(){
+  # Espera a que aparezca $QR_TXT o $QR_PNG (hasta N segundos)
+  local max_s=${1:-45}
+  local t=0
+  while (( t < max_s )); do
+    [[ -s "$QR_TXT" || -s "$QR_PNG" ]] && return 0
+    sleep 1
+    ((t++)) || true
+  done
   return 1
 }
 
-show_qr_console() {
 
+show_qr_console() {
   # Solo mostrar QR en consola si NO hay PNG (evita doble QR)
   if [[ -s "$QR_PNG" ]]; then
     return 0
@@ -375,71 +378,91 @@ show_qr_console() {
 }
 
 show_qr_png() {
-  [[ -s "$QR_PNG" ]] || return 1
-  if need_cmd chafa; then
-    chafa -f symbols -s 60x60 "$QR_PNG" 2>/dev/null || true
-    return 0
+  if [[ -s "$QR_PNG" ]]; then
+    echo -e "${GREEN}✅ PNG guardado: $QR_PNG${NC}"
+    # Preferir render nítido desde el texto QR si existe
+    if [[ -s "$QR_TXT" ]] && need_cmd qrencode; then
+      echo -e "${BOLD}🧾 QR nítido (qrencode)${NC}"
+      qrencode -t ANSIUTF8 < "$QR_TXT" 2>/dev/null || true
+      echo
+      return 0
+    fi
+    if need_cmd chafa; then
+      # Más grande para evitar 'borroso'
+      chafa -s 90x50 "$QR_PNG" 2>/dev/null || true
+    else
+      echo -e "${YELLOW}No hay visor en terminal. Descargalo por SCP:${NC}"
+      echo -e "  scp root@$(get_json '.bot.server_ip'):$QR_PNG ."
+    fi
   fi
-  if need_cmd viu; then
-    viu -w 60 "$QR_PNG" 2>/dev/null || true
-    return 0
-  fi
-  echo -e "${YELLOW}⚠️ No tengo visor de PNG (chafa/viu). Mostrando QR en texto:${NC}"
-  show_qr_console || true
-  return 0
 }
 
 ver_qr() {
   while true; do
-    clear
-    echo -e "${CYAN}${BOLD}📱 WhatsApp – QR / Vinculación${NC}"
+    header "📱 WhatsApp – QR / Vinculación"
     echo "----------------------------------------"
     echo "[1] Ver QR actual (sin borrar sesión)"
     echo "[2] Forzar QR nuevo (borrar sesión + reiniciar)"
     echo "[3] Ver logs (PM2)"
+    echo "[4] Borrar SOLO QR (png/txt)"
     echo "[0] Volver"
     echo
-    read -rp "Opción: " q
-    case "$q" in
+    read -rp "Opción: " o
+    case "$o" in
       1)
-        echo
-        echo -e "${CYAN}🧾 Mostrando QR (si está disponible)...${NC}"
-        echo
-        show_qr_best || true
-        pausa
+        header "📱 Ver QR actual"
+        echo "----------------------------------------"
+        # Mostrar nítido: preferimos QR_TXT con qrencode, si no PNG
+        if [[ -s "$QR_TXT" ]] && need_cmd qrencode; then
+          echo -e "${BOLD}🧾 QR nítido (qrencode)${NC}"
+          qrencode -t ANSIUTF8 < "$QR_TXT" 2>/dev/null || true
+          echo
+        else
+          # Si existe PNG, intentar mostrarlo
+          show_qr_png
+          # Si no hay PNG, intentar consola (pero NO mostrar logs si ya hay QR_TXT)
+          if [[ ! -s "$QR_PNG" ]]; then
+            show_qr_console
+          fi
+        fi
+        pause
         ;;
       2)
-        clear
-        echo -e "${CYAN}${BOLD}📱 Forzar QR NUEVO${NC}"
+        header "📱 Forzar QR NUEVO"
         echo "----------------------------------------"
         echo -e "${YELLOW}⚠️  Esto borra sesión y fuerza un QR NUEVO.${NC}"
         echo
         reset_whatsapp_session
-        echo -e "${CYAN}🔁 Reiniciando bot...${NC}"
+        echo -e "${YELLOW}🔁 Reiniciando bot...${NC}"
         if pm2_run describe "$BOT_NAME" >/dev/null 2>&1; then
           pm2_run restart "$BOT_NAME" >/dev/null 2>&1 || true
         else
           pm2_run start "$BOT_HOME/bot.js" --name "$BOT_NAME" --cwd "$BOT_HOME" >/dev/null 2>&1 || true
         fi
         pm2_run save >/dev/null 2>&1 || true
-
-        echo -e "${CYAN}⏳ Esperando QR (hasta 120s)...${NC}"
-        for i in {1..120}; do
-          [[ -s "$QR_TXT" || -s "$QR_PNG" ]] && break
-          sleep 1
-        done
+        echo -e "${YELLOW}⏳ Esperando QR (hasta 60s)...${NC}"
+        if wait_for_qr 60; then
+          echo -e "${GREEN}✅ QR generado.${NC}"
+        else
+          echo -e "${RED}❌ No apareció QR a tiempo.${NC}"
+          echo -e "${YELLOW}Probá ver logs (opción 3).${NC}"
+        fi
         echo
-        show_qr_best || true
-        echo
-        echo -e "${CYAN}👉 Escanealo desde tu WhatsApp principal: Dispositivos vinculados.${NC}"
-        pausa
+        pause
         ;;
       3)
-        pm2_run logs "$BOT_NAME" --lines 220
-        pausa
+        pm2_run logs "$BOT_NAME" --lines 250
+        pause
+        ;;
+      4)
+        header "🧹 Borrar QR (png/txt)"
+        echo "----------------------------------------"
+        rm -f "$QR_PNG" "$QR_TXT" >/dev/null 2>&1 || true
+        echo -e "${GREEN}✅ QR borrado. (No borra sesión)${NC}"
+        pause
         ;;
       0) return ;;
-      *) echo "Opción inválida"; sleep 1 ;;
+      *) echo -e "${RED}❌ Opción inválida${NC}"; sleep 1 ;;
     esac
   done
 }
@@ -610,7 +633,7 @@ hc_menu() {
   local active
   active=$(jq -r "$HC_ACTIVE_KEY" "$CONFIG_FILE" 2>/dev/null || echo "")
   [[ "$active" == "null" ]] && active=""
-  echo -e "${CYAN}HC activo:${NC} ${active:-(no configurado)}"
+  echo -e "${CYAN}HC activo:${NC} ${active:-"(no configurado)"}"
   pausa
   ;;
 2)
@@ -634,7 +657,7 @@ hc_menu() {
       fi
   if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel>=1 && sel<=${#files[@]} )); then
     chosen="${files[$((sel-1))]}"
-    cfg_set_json "$HC_ACTIVE_KEY" "$chosen"
+    cfg_set_json "$HC_ACTIVE_KEY" "\"$chosen\""
     echo -e "${GREEN}✅ HC activo seteado:${NC} $chosen"
   else
     echo "Opción inválida."
@@ -1322,5 +1345,9 @@ main_menu() {
     esac
   done
 }
+
+
+# Asegurar runtime (node/pm2) para que el panel siempre funcione
+ensure_runtime
 
 main_menu
