@@ -1443,7 +1443,7 @@ function main() {
     takeoverOnConflict: true,
     takeoverTimeoutMs: 0,
     puppeteer: {
-      headless: "new",
+      headless: true,
       executablePath: chromePath,
       timeout: 60000,
       args: [
@@ -1452,9 +1452,15 @@ function main() {
         "--disable-dev-shm-usage",
         "--disable-accelerated-2d-canvas",
         "--no-first-run",
-        "--no-zygote",
         "--disable-gpu",
-        "--single-process"
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-pings",
+        "--safebrowsing-disable-auto-update"
       ]
     }
   });
@@ -1549,10 +1555,10 @@ cat > "$BOT_HOME/package.json" <<'EOF'
   "main": "bot.js",
   "scripts": { "start": "node bot.js" },
   "dependencies": {
-    "axios": "^1.6.5",
-    "qrcode": "^1.5.4",
-    "qrcode-terminal": "^0.12.0",
-    "sqlite3": "^5.1.7",
+    "axios": "1.6.5",
+    "qrcode": "1.5.4",
+    "qrcode-terminal": "0.12.0",
+    "sqlite3": "5.1.7",
     "whatsapp-web.js": "1.24.0"
   }
 }
