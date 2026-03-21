@@ -237,7 +237,6 @@ cat > package.json << 'PKGEOF'
     "main": "bot.js",
     "dependencies": {
         "whatsapp-web.js": "1.24.0",
-        "puppeteer": "21.11.0",
         "qrcode-terminal": "^0.12.0",
         "qrcode": "^1.5.3",
         "moment": "^2.30.1",
@@ -279,21 +278,6 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const execPromise = util.promisify(exec);
-
-// ─── CHROMIUM: puppeteer@21 (compatible con wwebjs 1.24) ───────────────────
-// Google Chrome v120+ es INCOMPATIBLE: "Session closed at setUserAgent"
-function resolveChromePath() {
-  try {
-    const pptr = require('puppeteer');
-    if (pptr && typeof pptr.executablePath === 'function') {
-      const p = pptr.executablePath();
-      if (p && fs.existsSync(p)) return p;
-    }
-  } catch (_) {}
-  const fallbacks = ['/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium'];
-  for (const c of fallbacks) if (fs.existsSync(c)) return c;
-  return null;
-}
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 function loadConfig() {
@@ -341,23 +325,15 @@ console.log(chalk.yellow(`📍 IP: ${config.bot && config.bot.server_ip}`));
 console.log(chalk.yellow(`💳 MercadoPago: ${mpEnabled ? '✅ ACTIVO' : '❌ NO CONFIGURADO'}`));
 
 // ─── CLIENT ────────────────────────────────────────────────────────────────
-const chromePath = resolveChromePath();
-if (!chromePath) {
-  console.error(chalk.red('❌ FATAL: No se encontró Chromium. Reinstalá: cd /root/ssh-bot && npm install'));
-  process.exit(1);
-}
-console.log(chalk.green(`🌐 Chromium: ${chromePath}`));
-
 const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: '/root/.wwebjs_auth', clientId: 'ssh-bot' }),
-  webVersionCache: { type: 'none' },
-  puppeteer: {
-    headless: true,
-    executablePath: chromePath,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run', '--disable-extensions'],
-    timeout: 60000
-  },
-  authTimeoutMs: 0
+    authStrategy: new LocalAuth({dataPath: '/root/.wwebjs_auth', clientId: 'ssh-bot-v86'}),
+    puppeteer: {
+        headless: true,
+        executablePath: '/usr/bin/google-chrome',
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run', '--disable-extensions'],
+        timeout: 60000
+    },
+    authTimeoutMs: 60000
 });
 
 let qrCount = 0;
