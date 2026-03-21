@@ -241,9 +241,9 @@ const qrcode = require("qrcode");
 const qrcodeTerminal = require("qrcode-terminal");
 
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
-// puppeteer-core es provisto internamente por whatsapp-web.js
-// NO instalar puppeteer separado: genera mismatch de Chromium con Ubuntu 22/24
-// que provoca "Requesting main frame too early" y el bot no responde mensajes
+// puppeteer@21.11.0 se instala como dependencia (versión compatible con wwebjs 1.24)
+// NO usar puppeteer 22+: genera mismatch de Chrome API con Ubuntu 22/24
+// → "Session closed at setUserAgent" y bot nunca llega a ready
 
 const ROOT = "/root";
 const INSTALL_DIR = "/opt/ssh-bot";
@@ -254,13 +254,22 @@ const QR_TXT = path.join(ROOT, "qr-whatsapp.txt");
 const QR_PNG = path.join(ROOT, "qr-whatsapp.png");
 
 function resolveChromePath(cfg) {
-  // Prioridad: config.paths.chromium -> env -> sistema
-  // NO usar puppeteer bundled: versión nueva de puppeteer es incompatible con whatsapp-web.js 1.24
+  // IMPORTANTE: usar Chromium de puppeteer@21 (compatible con wwebjs 1.24)
+  // Google Chrome estable (v120+) es INCOMPATIBLE con puppeteer-core interno de wwebjs 1.24
+  // → genera "Session closed at setUserAgent" y el bot nunca llega a ready
+  try {
+    const pptr = require("puppeteer");
+    if (pptr && typeof pptr.executablePath === "function") {
+      const p = pptr.executablePath();
+      if (p && fs.existsSync(p)) return p;
+    }
+  } catch (_) {}
+  // Fallback: config.paths.chromium o env
   const fromCfg = cfg?.paths?.chromium;
   if (fromCfg && fs.existsSync(fromCfg)) return fromCfg;
   const env = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
   if (env && fs.existsSync(env)) return env;
-  // Fallbacks sistema
+  // Último recurso: Chrome del sistema (puede no funcionar)
   const candidates = [
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
@@ -1431,10 +1440,10 @@ function main() {
 
   const chromePath = resolveChromePath(config);
   if (!chromePath) {
-    log("❌ FATAL: No se encontró Google Chrome. Instalá: wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && apt install ./google-chrome-stable_current_amd64.deb");
+    log("❌ FATAL: No se encontró Chromium/Chrome. Reinstalá con: cd /root/ssh-bot && npm install");
     process.exit(1);
   }
-  log(`🌐 Chrome: ${chromePath}`);
+  log(`🌐 Chromium: ${chromePath}`);
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: "ssh-bot", dataPath: BOT_HOME }),
@@ -1442,6 +1451,7 @@ function main() {
     qrMaxRetries: 10,
     takeoverOnConflict: true,
     takeoverTimeoutMs: 0,
+    webVersionCache: { type: "none" },
     puppeteer: {
       headless: true,
       executablePath: chromePath,
@@ -1556,6 +1566,7 @@ cat > "$BOT_HOME/package.json" <<'EOF'
   "scripts": { "start": "node bot.js" },
   "dependencies": {
     "axios": "1.6.5",
+    "puppeteer": "21.11.0",
     "qrcode": "1.5.4",
     "qrcode-terminal": "0.12.0",
     "sqlite3": "5.1.7",
@@ -1566,7 +1577,17 @@ EOF
 
 cd "$BOT_HOME"
 npm cache clean --force >/dev/null 2>&1 || true
-npm install --silent >/dev/null 2>&1 || true
+echo -e "${YELLOW}📦 Instalando dependencias (puede tardar 2-3 min, descarga Chromium)...${NC}"
+# PUPPETEER_SKIP_DOWNLOAD=0 asegura que descargue su propio Chromium (compatible con wwebjs 1.24)
+PUPPETEER_SKIP_DOWNLOAD=0 npm install 2>&1 | tail -5 || true
+
+# Verificar que puppeteer descargó su Chromium
+PPTR_CHROME="$(node -e "try{const p=require('puppeteer');console.log(p.executablePath())}catch(e){console.log('')}" 2>/dev/null || true)"
+if [[ -n "$PPTR_CHROME" && -f "$PPTR_CHROME" ]]; then
+  echo -e "${GREEN}✅ Chromium puppeteer: $PPTR_CHROME${NC}"
+else
+  echo -e "${YELLOW}⚠️  Chromium puppeteer no encontrado, se usará Google Chrome del sistema${NC}"
+fi
 
 # ✅ Parche whatsapp-web.js (anti-markedUnread) – MISMO FIX que v8.6 funcional
 # 1) markedUnread: true → false
