@@ -9,8 +9,6 @@ if (set -o pipefail 2>/dev/null); then set -o pipefail; fi
 
 BOT_VERSION="8.8.27"
 BOT_NAME="ssh-bot"
-
-# Ruta del script (funciona tanto en bash directo como en pipe)
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 
 INSTALL_DIR="/opt/ssh-bot"
@@ -82,7 +80,7 @@ echo -e "   ✅ 📱 QR FIX: Vincular WhatsApp desde panel (TXT/PNG)"
 echo
 read -rp "$(echo -e "${YELLOW}¿Continuar? (s/N): ${NC}")" -n 1 -r REPLY < /dev/tty || true
 echo
-[[ ! "${REPLY:-}" =~ ^[Ss]$ ]] && { echo "Cancelado."; exit 0; }
+[[ ! $REPLY =~ ^[Ss]$ ]] && { echo "Cancelado."; exit 0; }
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -94,6 +92,7 @@ apt-get install -y -qq \
   ca-certificates gnupg \
   software-properties-common \
   libgbm-dev libxshmfence-dev \
+  # deps típicas para Chromium/Puppeteer (Ubuntu 22/24)
   libnss3 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
   libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
   libgtk-3-0 libasound2 fonts-liberation xdg-utils \
@@ -153,11 +152,6 @@ if [[ ! -s "$CONFIG_FILE" ]]; then
     "apk_url": "",
     "custom_url": "",
     "custom_message": "📲 *HTTP Custom*\n\n⬇️ Descargá desde:\n{URL}\n\nLuego importá tu archivo .hc (HWID) y conectá."
-  },
-  "paths": {
-    "chromium": "/usr/bin/google-chrome",
-    "database": "${DB_FILE}",
-    "qr_codes": "${INSTALL_DIR}/qr_codes"
   }
 }
 EOF
@@ -241,9 +235,14 @@ const qrcode = require("qrcode");
 const qrcodeTerminal = require("qrcode-terminal");
 
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
-// puppeteer@21.11.0 se instala como dependencia (versión compatible con wwebjs 1.24)
-// NO usar puppeteer 22+: genera mismatch de Chrome API con Ubuntu 22/24
-// → "Session closed at setUserAgent" y bot nunca llega a ready
+// puppeteer@21.11.0 instalado como dep (compatible con wwebjs 1.24)
+// puppeteer@22+ usa Chrome v120+ que es INCOMPATIBLE → "Session closed at setUserAgent"
+let puppeteer = null;
+try {
+  puppeteer = require("puppeteer");
+} catch (e) {
+  puppeteer = null;
+}
 
 const ROOT = "/root";
 const INSTALL_DIR = "/opt/ssh-bot";
@@ -254,22 +253,20 @@ const QR_TXT = path.join(ROOT, "qr-whatsapp.txt");
 const QR_PNG = path.join(ROOT, "qr-whatsapp.png");
 
 function resolveChromePath(cfg) {
-  // IMPORTANTE: usar Chromium de puppeteer@21 (compatible con wwebjs 1.24)
-  // Google Chrome estable (v120+) es INCOMPATIBLE con puppeteer-core interno de wwebjs 1.24
-  // → genera "Session closed at setUserAgent" y el bot nunca llega a ready
+  // puppeteer@21 tiene su Chromium propio (v117, compatible con wwebjs 1.24)
+  // Google Chrome del sistema (v120+) es INCOMPATIBLE → "Session closed at setUserAgent"
   try {
-    const pptr = require("puppeteer");
-    if (pptr && typeof pptr.executablePath === "function") {
-      const p = pptr.executablePath();
+    if (puppeteer && typeof puppeteer.executablePath === "function") {
+      const p = puppeteer.executablePath();
       if (p && fs.existsSync(p)) return p;
     }
   } catch (_) {}
-  // Fallback: config.paths.chromium o env
+  // Fallback: config o variables de entorno
   const fromCfg = cfg?.paths?.chromium;
   if (fromCfg && fs.existsSync(fromCfg)) return fromCfg;
   const env = process.env.PUPPETEER_EXECUTABLE_PATH || process.env.CHROME_PATH;
   if (env && fs.existsSync(env)) return env;
-  // Último recurso: Chrome del sistema (puede no funcionar)
+  // Último recurso: Chrome del sistema
   const candidates = [
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
@@ -1440,7 +1437,7 @@ function main() {
 
   const chromePath = resolveChromePath(config);
   if (!chromePath) {
-    log("❌ FATAL: No se encontró Chromium/Chrome. Reinstalá con: cd /root/ssh-bot && npm install");
+    log("❌ FATAL: No se encontró Chromium. Reinstalá: cd /root/ssh-bot && npm install");
     process.exit(1);
   }
   log(`🌐 Chromium: ${chromePath}`);
@@ -1462,15 +1459,7 @@ function main() {
         "--disable-dev-shm-usage",
         "--disable-accelerated-2d-canvas",
         "--no-first-run",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-default-apps",
-        "--disable-sync",
-        "--metrics-recording-only",
-        "--mute-audio",
-        "--no-pings",
-        "--safebrowsing-disable-auto-update"
+        "--disable-gpu"
       ]
     }
   });
@@ -1486,14 +1475,13 @@ function main() {
     try { fs.unlinkSync(QR_TXT); } catch {}
     try { fs.unlinkSync(QR_PNG); } catch {}
 
-    // Auto-verificación MercadoPago (cada 2 min)
     if (MP_ENABLED) {
       log("💳 MercadoPago: verificación automática cada 2 minutos.");
       setTimeout(() => { mpProcessPendingPayments(client).catch(()=>{}); }, 8000);
       setInterval(() => { mpProcessPendingPayments(client).catch(()=>{}); }, 120000);
     }
 
-    // Transferencias: siempre activas (entregar confirmados + recordatorios)
+    // Transferencias: siempre activas
     setTimeout(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 12000);
     setInterval(() => { transferProcessApprovedPayments(client).catch(()=>{}); }, 60000);
     setInterval(() => { transferSendReminders(client).catch(()=>{}); }, 60000);
@@ -1566,6 +1554,10 @@ cat > "$BOT_HOME/package.json" <<'EOF'
   "scripts": { "start": "node bot.js" },
   "dependencies": {
     "axios": "1.6.5",
+    "chalk": "4.1.2",
+    "mercadopago": "2.0.15",
+    "moment": "2.30.1",
+    "node-cron": "3.0.3",
     "puppeteer": "21.11.0",
     "qrcode": "1.5.4",
     "qrcode-terminal": "0.12.0",
@@ -1578,29 +1570,25 @@ EOF
 cd "$BOT_HOME"
 npm cache clean --force >/dev/null 2>&1 || true
 echo -e "${YELLOW}📦 Instalando dependencias (puede tardar 2-3 min, descarga Chromium)...${NC}"
-# PUPPETEER_SKIP_DOWNLOAD=0 asegura que descargue su propio Chromium (compatible con wwebjs 1.24)
 PUPPETEER_SKIP_DOWNLOAD=0 npm install 2>&1 | tail -5 || true
 
-# Verificar que puppeteer descargó su Chromium
 PPTR_CHROME="$(node -e "try{const p=require('puppeteer');console.log(p.executablePath())}catch(e){console.log('')}" 2>/dev/null || true)"
 if [[ -n "$PPTR_CHROME" && -f "$PPTR_CHROME" ]]; then
-  echo -e "${GREEN}✅ Chromium puppeteer: $PPTR_CHROME${NC}"
+  echo -e "${GREEN}✅ Chromium puppeteer OK: $PPTR_CHROME${NC}"
 else
   echo -e "${YELLOW}⚠️  Chromium puppeteer no encontrado, se usará Google Chrome del sistema${NC}"
 fi
 
-# ✅ Parche whatsapp-web.js (anti-markedUnread) – MISMO FIX que v8.6 funcional
-# 1) markedUnread: true → false
+# Parche whatsapp-web.js (anti-markedUnread) – best-effort
+# 1) Ajuste simple (cuando existe la clave markedUnread)
 find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
   sed -i "s/markedUnread: true/markedUnread: false/g" {} \; 2>/dev/null || true
-# 2) if(chat && chat.markedUnread) → if(false && ...)
+# 2) Fallback defensivo (algunas versiones traen el if(chat && chat.markedUnread))
 find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
-  sed -i 's/if (chat && chat.markedUnread)/if (false \&\& chat.markedUnread)/g' {} \; 2>/dev/null || true
-# 3) Deshabilitar sendSeen por completo (causa crash silencioso al responder)
+  sed -i "s/if (chat && chat.markedUnread)/if (false \\&\\& chat.markedUnread)/g" {} \; 2>/dev/null || true
+# 3) Fallback extra (deshabilitar sendSeen si tu build lo usa y rompe por markedUnread)
 find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
-  sed -i 's/const sendSeen = async (chatId) => {/const sendSeen = async (chatId) => { console.log("[PATCH] sendSeen disabled"); return;/g' {} \; 2>/dev/null || true
-
-echo -e "${GREEN}✅ Parche markedUnread+sendSeen aplicado${NC}"
+  sed -i "s/const sendSeen = async (chatId) => {/const sendSeen = async (chatId) => { console.log(\\"[DEBUG] sendSeen deshabilitado\\"); return; /g" {} \; 2>/dev/null || true
 
 # Auto-refresh cada 2 horas
 ( crontab -l 2>/dev/null | grep -v 'ssh-bot-refresh' ) | crontab - || true
@@ -1622,7 +1610,9 @@ pm2 save >/dev/null 2>&1 || true
 echo -e "${CYAN}${BOLD}📊 Instalando panel admin (sshbot)...${NC}"
 mkdir -p /usr/local/bin
 
-# Descargar panel desde repo (URL directa a panel_admin.sh)
+# ✅ Panel separado para evitar scripts gigantes y errores de pegado.
+# Si existe backendmgr.sh en el mismo directorio del instalador, lo usa.
+# Si no, lo descarga desde GitHub (PANEL_URL).
 PANEL_URL="https://raw.githubusercontent.com/eze1087/bootsshx2/main/panel_admin.sh"
 PANEL_PATH="/usr/local/bin/sshbot"
 
@@ -1632,12 +1622,9 @@ if curl -fsSL "$PANEL_URL" -o "$PANEL_PATH" 2>/dev/null; then
 elif wget -qO "$PANEL_PATH" "$PANEL_URL" 2>/dev/null; then
   echo -e "${GREEN}✅ Panel descargado OK (wget)${NC}"
 else
-  echo -e "${RED}❌ ERROR: No se pudo descargar el panel admin desde:${NC}"
-  echo -e "${YELLOW}   $PANEL_URL${NC}"
-  echo -e "${YELLOW}➡️  Verificá que panel_admin.sh esté en el repo bootsshx2${NC}"
+  echo -e "${RED}❌ ERROR: No se pudo descargar el panel desde: $PANEL_URL${NC}"
   exit 1
 fi
-
 chmod +x "$PANEL_PATH"
 hash -r 2>/dev/null || true
 
