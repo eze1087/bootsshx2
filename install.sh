@@ -252,12 +252,28 @@ PKGEOF
 echo -e "${YELLOW}📦 Instalando paquetes Node.js...${NC}"
 npm install --silent 2>&1 | grep -v "npm WARN" || true
 
-# ✅ APLICAR PARCHE PARA ERROR markedUnread (FIX 3)
-echo -e "${YELLOW}🔧 Aplicando parche para error WhatsApp Web...${NC}"
-find node_modules/whatsapp-web.js -name "Client.js" -type f -exec sed -i 's/if (chat && chat.markedUnread)/if (false \&\& chat.markedUnread)/g' {} \; 2>/dev/null || true
-find node_modules/whatsapp-web.js -name "Client.js" -type f -exec sed -i 's/const sendSeen = async (chatId) => {/const sendSeen = async (chatId) => { console.log("[DEBUG] sendSeen deshabilitado"); return;/g' {} \; 2>/dev/null || true
+# ✅ PARCHES whatsapp-web.js
+echo -e "${YELLOW}🔧 Aplicando parches a WhatsApp Web...${NC}"
 
-echo -e "${GREEN}✅ Parche markedUnread aplicado${NC}"
+# 1. markedUnread
+find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
+  sed -i 's/if (chat && chat.markedUnread)/if (false \&\& chat.markedUnread)/g' {} \; 2>/dev/null || true
+
+# 2. sendSeen (causa crash silencioso al responder mensajes)
+find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
+  sed -i 's/const sendSeen = async (chatId) => {/const sendSeen = async (chatId) => { console.log("[PATCH] sendSeen disabled"); return;/g' {} \; 2>/dev/null || true
+
+# 3. setUserAgent crash (Session closed / Target closed) - EL MÁS IMPORTANTE
+find node_modules/whatsapp-web.js -name "Client.js" -type f -exec \
+  sed -i 's/await page\.setUserAgent(useragent);/try { await page.setUserAgent(useragent); } catch(_e) { console.log("[PATCH] setUserAgent skipped"); }/g' {} \; 2>/dev/null || true
+
+# 4. LocalWebCache null crash (Cannot read properties of null reading 1)
+find node_modules/whatsapp-web.js -name "LocalWebCache.js" -type f -exec \
+  sed -i "s/const version = htmlFile\.match(/const version = (htmlFile ? htmlFile.match(/g" {} \; 2>/dev/null || true
+find node_modules/whatsapp-web.js -name "LocalWebCache.js" -type f -exec \
+  sed -i "s/const version = (htmlFile ? htmlFile\.match(\(.*\))\[1\]/const version = (htmlFile ? htmlFile.match(\1) || [] : [])[1]/g" {} \; 2>/dev/null || true
+
+echo -e "${GREEN}✅ Parches aplicados${NC}"
 
 # Crear bot.js CON TODOS LOS FIXES
 echo -e "${YELLOW}📝 Creando bot.js con todos los fixes...${NC}"
