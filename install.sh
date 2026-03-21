@@ -10,6 +10,9 @@ if (set -o pipefail 2>/dev/null); then set -o pipefail; fi
 BOT_VERSION="8.8.27"
 BOT_NAME="ssh-bot"
 
+# Ruta del script (funciona tanto en bash directo como en pipe)
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+
 INSTALL_DIR="/opt/ssh-bot"
 BOT_HOME="/root/ssh-bot"
 DB_FILE="$INSTALL_DIR/data/users.db"
@@ -77,11 +80,9 @@ echo -e "   ✅ 🌐 Custom/HTTP: mensaje + URL editables desde panel (para el c
 echo -e "   ✅ 🆘 Soporte/Tutorial: WhatsApp + Telegram + links editables desde panel"
 echo -e "   ✅ 📱 QR FIX: Vincular WhatsApp desde panel (TXT/PNG)"
 echo
-# Fix para curl | bash: redirigir stdin al terminal para el prompt interactivo
-[[ ! -t 0 ]] && [[ -r /dev/tty ]] && exec 0</dev/tty
-read -rp "$(echo -e "${YELLOW}¿Continuar? (s/N): ${NC}")" -n 1 -r
+read -rp "$(echo -e "${YELLOW}¿Continuar? (s/N): ${NC}")" -n 1 -r REPLY < /dev/tty || true
 echo
-[[ ! $REPLY =~ ^[Ss]$ ]] && { echo "Cancelado."; exit 0; }
+[[ ! "${REPLY:-}" =~ ^[Ss]$ ]] && { echo "Cancelado."; exit 0; }
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -93,7 +94,6 @@ apt-get install -y -qq \
   ca-certificates gnupg \
   software-properties-common \
   libgbm-dev libxshmfence-dev \
-  # deps típicas para Chromium/Puppeteer (Ubuntu 22/24)
   libnss3 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
   libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
   libgtk-3-0 libasound2 fonts-liberation xdg-utils \
@@ -1595,31 +1595,23 @@ pm2 save >/dev/null 2>&1 || true
 echo -e "${CYAN}${BOLD}📊 Instalando panel admin (sshbot)...${NC}"
 mkdir -p /usr/local/bin
 
-# ✅ Panel separado para evitar scripts gigantes y errores de pegado.
-# Si existe backendmgr.sh en el mismo directorio del instalador, lo usa.
-# Si no, lo descarga desde GitHub (PANEL_URL).
-PANEL_LOCAL_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P 2>/dev/null || echo "")"
-PANEL_LOCAL="${PANEL_LOCAL_DIR}/backendmgr.sh"
+# Descargar panel desde repo (URL directa a panel_admin.sh)
+PANEL_URL="https://raw.githubusercontent.com/eze1087/bootsshx2/main/panel_admin.sh"
+PANEL_PATH="/usr/local/bin/sshbot"
 
-PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootssh.8.27/main/backendmgr.sh"
-PANEL_URL="${PANEL_URL:-$PANEL_URL_DEFAULT}"
-
-PANEL_PATH="/usr/local/bin/backendmgr"
-
-if [[ -n "$PANEL_LOCAL_DIR" && -f "$PANEL_LOCAL" ]]; then
-  cp -f "$PANEL_LOCAL" "$PANEL_PATH"
+echo -e "${CYAN}⬇️  Descargando panel admin...${NC}"
+if curl -fsSL "$PANEL_URL" -o "$PANEL_PATH" 2>/dev/null; then
+  echo -e "${GREEN}✅ Panel descargado OK${NC}"
+elif wget -qO "$PANEL_PATH" "$PANEL_URL" 2>/dev/null; then
+  echo -e "${GREEN}✅ Panel descargado OK (wget)${NC}"
 else
-  (curl -fsSL "$PANEL_URL" -o "$PANEL_PATH" || wget -qO "$PANEL_PATH" "$PANEL_URL") || {
-    echo -e "${RED}❌ ERROR: No se pudo descargar el panel admin.${NC}"
-    echo -e "${YELLOW}➡️ Subí backendmgr.sh al repo y verificá PANEL_URL.${NC}"
-    exit 1
-  }
+  echo -e "${RED}❌ ERROR: No se pudo descargar el panel admin desde:${NC}"
+  echo -e "${YELLOW}   $PANEL_URL${NC}"
+  echo -e "${YELLOW}➡️  Verificá que panel_admin.sh esté en el repo bootsshx2${NC}"
+  exit 1
 fi
 
 chmod +x "$PANEL_PATH"
-ln -sf "$PANEL_PATH" /usr/local/bin/sshbot
-chmod +x /usr/local/bin/sshbot
-hash -r 2>/dev/null || true
 hash -r 2>/dev/null || true
 
 echo
