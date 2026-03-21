@@ -77,6 +77,8 @@ echo -e "   ✅ 🌐 Custom/HTTP: mensaje + URL editables desde panel (para el c
 echo -e "   ✅ 🆘 Soporte/Tutorial: WhatsApp + Telegram + links editables desde panel"
 echo -e "   ✅ 📱 QR FIX: Vincular WhatsApp desde panel (TXT/PNG)"
 echo
+# Fix para curl | bash: redirigir stdin al terminal para el prompt interactivo
+[[ ! -t 0 ]] && [[ -r /dev/tty ]] && exec 0</dev/tty
 read -rp "$(echo -e "${YELLOW}¿Continuar? (s/N): ${NC}")" -n 1 -r
 echo
 [[ ! $REPLY =~ ^[Ss]$ ]] && { echo "Cancelado."; exit 0; }
@@ -1599,7 +1601,7 @@ mkdir -p /usr/local/bin
 PANEL_LOCAL_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P 2>/dev/null || echo "")"
 PANEL_LOCAL="${PANEL_LOCAL_DIR}/backendmgr.sh"
 
-PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootsshx2/refs/heads/main/panel_admin.sh"
+PANEL_URL_DEFAULT="https://raw.githubusercontent.com/eze1087/bootssh.8.27/main/backendmgr.sh"
 PANEL_URL="${PANEL_URL:-$PANEL_URL_DEFAULT}"
 
 PANEL_PATH="/usr/local/bin/backendmgr"
